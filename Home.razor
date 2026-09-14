@@ -1,0 +1,27 @@
+@page "/"
+
+<h1>Smart-X Gateway Console</h1>
+<p class="subtitle">Select a module to continue.</p>
+
+<div class="tile-grid">
+    <a class="tile tile-active" href="/ingestion">
+        <div class="tile-icon">📡</div>
+        <h2>Sensor Data Ingestion &amp; Telemetry</h2>
+        <p>Register sensors, push readings, and watch live health scores.</p>
+        <span class="tile-status active">Available - Part 1</span>
+    </a>
+
+    <div class="tile tile-disabled" title="Coming in Part 2">
+        <div class="tile-icon">⏱️</div>
+        <h2>Real-Time Command Stream &amp; History</h2>
+        <p>Issue commands to devices and replay their execution history.</p>
+        <span class="tile-status disabled">Disabled - Part 2</span>
+    </div>
+
+    <div class="tile tile-disabled" title="Coming in the final PoE">
+        <div class="tile-icon">🕸️</div>
+        <h2>Network Topology &amp; Mesh Routing</h2>
+        <p>Visualise the sensor mesh and optimise routing paths.</p>
+        <span class="tile-status disabled">Disabled - Final PoE</span>
+    </div>
+</div>

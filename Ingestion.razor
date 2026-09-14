@@ -1,0 +1,402 @@
+@page "/ingestion"
+@inject SmartXApiClient Api
+@implements IDisposable
+@using System.Text.RegularExpressions
+
+<h1>Sensor Data Ingestion &amp; Telemetry</h1>
+
+<section class="panel">
+    <h2>1. Register a sensor</h2>
+    <div class="form-row">
+        <div class="field-group">
+            <input @bind="newMac" placeholder="MAC address / unique ID (e.g. AA:BB:CC:11:22:33)" class="@(macError is not null ? "input-error" : "")" />
+            @if (macError is not null)
+            {
+                <span class="field-error">@macError</span>
+            }
+        </div>
+        <div class="field-group">
+            <input @bind="newLocation" placeholder="Deployment location (e.g. Sub-Zone B -> Zone 1 -> Facility A)" class="@(locationError is not null ? "input-error" : "")" />
+            @if (locationError is not null)
+            {
+                <span class="field-error">@locationError</span>
+            }
+        </div>
+        <select @bind="newCategory">
+            <option value="Environmental">Environmental</option>
+            <option value="PowerConsumption">Power Consumption</option>
+            <option value="Actuator">Actuator</option>
+        </select>
+        <button class="btn primary" @onclick="RegisterSensorAsync">Register sensor</button>
+    </div>
+    @if (!string.IsNullOrEmpty(statusMessage))
+    {
+        <p class="status">@statusMessage</p>
+    }
+</section>
+
+<section class="panel">
+    <h2>2. Sensor Health Scores <span class="hint">(the dynamic engagement feature)</span></h2>
+    <p class="hint">Clean readings raise the score and extend a streak. Anomalies and disconnects snap the streak
+        back to zero and drop the score, so a problem sensor visually stands out immediately.</p>
+
+    <div class="health-grid">
+        @foreach (var sensor in sensors)
+        {
+            <div class="health-card @HealthClass(sensor.HealthScore)">
+                <div class="health-card-top">
+                    <strong>@sensor.MacAddress</strong>
+                    <span class="badge">@sensor.Badge</span>
+                </div>
+                <div class="score-bar-track">
+                    <div class="score-bar-fill" style="width:@(sensor.HealthScore)%"></div>
+                </div>
+                <div class="health-card-stats">
+                    <span>Score: @sensor.HealthScore</span>
+                    <span>🔥 Streak: @sensor.Streak</span>
+                </div>
+                <div class="health-card-meta">@sensor.Category · @sensor.DeploymentLocation</div>
+
+                @if (sensor.AttachedMedia.Any())
+                {
+                    <div class="media-list">
+                        @foreach (var file in sensor.AttachedMedia)
+                        {
+                            <a href="@($"{Api.BaseAddress}/api/sensors/{sensor.Id}/media/{file}/download")" target="_blank" class="media-link">
+                                🔒 @file (click to decrypt & download)
+                            </a>
+                        }
+                    </div>
+                }
+
+                <div class="form-row small">
+                    <select @bind="selectedValueType[sensor.Id]">
+                        <option value="float">float</option>
+                        <option value="int">int</option>
+                        <option value="bool">bool</option>
+                    </select>
+                    <input placeholder="value" @bind="pendingValue[sensor.Id]" />
+                    <button class="btn small" @onclick="() => SendTelemetryAsync(sensor)">Push reading</button>
+                    <button class="btn small danger" @onclick="() => SimulateDisconnectAsync(sensor)">Simulate disconnect</button>
+                </div>
+
+                <div class="form-row small">
+                    <InputFile OnChange="e => OnFileSelected(e, sensor.Id)" />
+                </div>
+            </div>
+        }
+        @if (!sensors.Any())
+        {
+            <p class="hint">No sensors registered yet - add one above to start streaming telemetry.</p>
+        }
+    </div>
+</section>
+
+<section class="panel">
+    <h2>3. Live telemetry feed</h2>
+    <div class="table-wrap">
+    <table class="feed-table">
+        <thead>
+            <tr><th>Time (UTC)</th><th>Device</th><th>Value</th><th>Unit</th><th>Status</th></tr>
+        </thead>
+        <tbody>
+            @foreach (var item in feed)
+            {
+                <tr class="@(item.IsAnomalous ? "row-anomaly" : "")">
+                    <td>@item.TimestampUtc.ToString("HH:mm:ss")</td>
+                    <td>@item.DeviceId</td>
+                    <td>@item.Value</td>
+                    <td>@item.Unit</td>
+                    <td>@(item.IsAnomalous ? "⚠ Anomaly" : "OK")</td>
+                </tr>
+            }
+        </tbody>
+    </table>
+    </div>
+</section>
+
+<section class="panel">
+    <h2>4. Aggregate meter load <span class="hint">(operator overloading demo)</span></h2>
+    <p class="hint">Combines two readings using the overloaded <code>+</code>, <code>-</code>, <code>&gt;</code> and
+        <code>==</code> operators on the <code>SensorReading</code> struct - e.g. Meter = Meter1 + Meter2.</p>
+    <div class="form-row">
+        <input @bind="aggDeviceA" placeholder="Device A id (e.g. MeterA)" />
+        <input @bind="aggMagA" placeholder="Device A load (W)" />
+        <input @bind="aggDeviceB" placeholder="Device B id (e.g. MeterB)" />
+        <input @bind="aggMagB" placeholder="Device B load (W)" />
+        <button class="btn primary" @onclick="AggregateAsync">Combine readings</button>
+    </div>
+    @if (aggregateResult is not null)
+    {
+        <ul class="result-list">
+            <li>Sum (A + B): <strong>@aggregateResult.Sum.DeviceId</strong> = @aggregateResult.Sum.Magnitude W</li>
+            <li>Delta (A - B): <strong>@aggregateResult.Delta.DeviceId</strong> = @aggregateResult.Delta.Magnitude W</li>
+            <li>A &gt; B: @aggregateResult.AIsGreaterThanB · A &lt; B: @aggregateResult.AIsLessThanB · A == B: @aggregateResult.AEqualsB</li>
+        </ul>
+    }
+</section>
+
+<section class="panel">
+    <h2>5. Load historical batch <span class="hint">(jagged array demo)</span></h2>
+    <p class="hint">Loads a raw sample batch into the server's jagged-array buffer, then promotes it into the
+        optimised <code>List&lt;TelemetryPacket&lt;double&gt;&gt;</code> archive.</p>
+    <div class="form-row">
+        <input @bind="batchDeviceId" placeholder="Device id" />
+        <input @bind="batchSamplesCsv" placeholder="Comma-separated samples e.g. 21.1,21.4,45.0,21.3" style="min-width:320px" />
+        <button class="btn primary" @onclick="LoadBatchAsync">Load batch</button>
+    </div>
+    @if (!string.IsNullOrEmpty(batchStatus))
+    {
+        <p class="status">@batchStatus</p>
+    }
+</section>
+
+<section class="panel">
+    <h2>6. Validate deployment tree <span class="hint">(recursion demo)</span></h2>
+    <p class="hint">Recursively checks a nested Facility -&gt; Zone -&gt; SubZone -&gt; Node tree. Edit the JSON below
+        (e.g. break a "Tier" value) and re-validate to see the recursive error message.</p>
+    <textarea @bind="deploymentTreeJson" rows="10" class="json-box"></textarea>
+    <div class="form-row">
+        <button class="btn primary" @onclick="ValidateTreeAsync">Validate tree</button>
+    </div>
+    @if (deploymentValidation is not null)
+    {
+        <p class="status">Result: @(deploymentValidation.IsValid ? "✅ Valid" : "❌ Invalid")</p>
+        @if (deploymentValidation.Errors.Any())
+        {
+            <ul class="result-list">
+                @foreach (var err in deploymentValidation.Errors)
+                {
+                    <li>@err</li>
+                }
+            </ul>
+        }
+    }
+    else if (!string.IsNullOrEmpty(deploymentRawError))
+    {
+        <p class="status">@deploymentRawError</p>
+    }
+</section>
+
+@code {
+    private string newMac = string.Empty;
+    private string newLocation = string.Empty;
+    private string newCategory = "Environmental";
+    private string statusMessage = string.Empty;
+    private string? macError;
+    private string? locationError;
+
+    // ASSIGNMENT REQUIREMENT: client-side validation, checked before the
+    // request ever leaves the browser, on top of the API's own server-side checks.
+    private static readonly Regex MacPattern = new(@"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$", RegexOptions.Compiled);
+
+    private List<SensorProfileDto> sensors = new();
+    private List<TelemetryFeedItemDto> feed = new();
+
+    private readonly Dictionary<string, string> selectedValueType = new();
+    private readonly Dictionary<string, string> pendingValue = new();
+
+    private System.Threading.Timer? refreshTimer;
+
+    // --- Operator overloading demo state ---
+    private string aggDeviceA = "MeterA";
+    private string aggMagA = "850";
+    private string aggDeviceB = "MeterB";
+    private string aggMagB = "410";
+    private AggregateResultDto? aggregateResult;
+
+    // --- Jagged array demo state ---
+    private string batchDeviceId = string.Empty;
+    private string batchSamplesCsv = "21.1,21.4,45.0,21.3";
+    private string batchStatus = string.Empty;
+
+    // --- Recursion demo state ---
+    private string deploymentTreeJson = @"{
+  ""name"": ""Facility A"",
+  ""tier"": ""Facility"",
+  ""children"": [
+    {
+      ""name"": ""Zone 1"",
+      ""tier"": ""Zone"",
+      ""children"": [
+        {
+          ""name"": ""Sub-Zone B"",
+          ""tier"": ""SubZone"",
+          ""children"": [
+            { ""name"": ""Node 4"", ""tier"": ""Node"", ""children"": [] }
+          ]
+        }
+      ]
+    }
+  ]
+}";
+    private DeploymentValidationResultDto? deploymentValidation;
+    private string? deploymentRawError;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await RefreshAsync();
+        refreshTimer = new System.Threading.Timer(async _ => await InvokeAsync(async () =>
+        {
+            await RefreshAsync();
+            StateHasChanged();
+        }), null, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(3));
+    }
+
+    private async Task RefreshAsync()
+    {
+        sensors = await Api.GetSensorsAsync();
+        feed = await Api.GetFeedAsync(take: 30);
+
+        foreach (var s in sensors)
+        {
+            selectedValueType.TryAdd(s.Id, "float");
+            pendingValue.TryAdd(s.Id, string.Empty);
+        }
+    }
+
+    private async Task RegisterSensorAsync()
+    {
+        macError = null;
+        locationError = null;
+
+        if (string.IsNullOrWhiteSpace(newMac))
+        {
+            macError = "MAC address is required.";
+        }
+        else if (!MacPattern.IsMatch(newMac.Trim()))
+        {
+            macError = "Use the format AA:BB:CC:11:22:33 (six hex pairs separated by colons).";
+        }
+
+        if (string.IsNullOrWhiteSpace(newLocation))
+        {
+            locationError = "Deployment location is required.";
+        }
+        else if (newLocation.Trim().Length < 3)
+        {
+            locationError = "Location looks too short - add a zone or facility name.";
+        }
+
+        if (macError is not null || locationError is not null)
+        {
+            statusMessage = string.Empty;
+            return;
+        }
+
+        try
+        {
+            var created = await Api.RegisterSensorAsync(newMac.Trim(), newLocation.Trim(), newCategory);
+            statusMessage = created is null ? "Registration failed." : $"Registered {created.MacAddress}.";
+            newMac = string.Empty;
+            newLocation = string.Empty;
+            await RefreshAsync();
+        }
+        catch (Exception ex)
+        {
+            statusMessage = $"Could not reach the API - is SmartX.Api running? ({ex.Message})";
+        }
+    }
+
+    private async Task SendTelemetryAsync(SensorProfileDto sensor)
+    {
+        var valueType = selectedValueType.GetValueOrDefault(sensor.Id, "float");
+        var value = pendingValue.GetValueOrDefault(sensor.Id, string.Empty);
+        if (string.IsNullOrWhiteSpace(value)) return;
+
+        // Environmental sensors default to a 15-30 band, power sensors 0-2000W,
+        // actuators (bool) have no numeric band.
+        var (min, max) = sensor.Category switch
+        {
+            "Environmental" => (15d, 30d),
+            "PowerConsumption" => (0d, 2000d),
+            _ => (double.NegativeInfinity, double.PositiveInfinity)
+        };
+
+        await Api.SendTelemetryAsync(sensor.Id, valueType, value, UnitFor(sensor.Category), min, max);
+        pendingValue[sensor.Id] = string.Empty;
+        await RefreshAsync();
+    }
+
+    private async Task SimulateDisconnectAsync(SensorProfileDto sensor)
+    {
+        await Api.SimulateDisconnectAsync(sensor.Id);
+        await RefreshAsync();
+    }
+
+    private async Task OnFileSelected(InputFileChangeEventArgs e, string sensorId)
+    {
+        var file = e.File;
+        if (file is null) return;
+        await using var stream = file.OpenReadStream(maxAllowedSize: 10 * 1024 * 1024);
+        await Api.UploadMediaAsync(sensorId, stream, file.Name, file.ContentType);
+        statusMessage = $"Attached {file.Name} to sensor.";
+        await RefreshAsync();
+    }
+
+    private static string UnitFor(string category) => category switch
+    {
+        "Environmental" => "°C",
+        "PowerConsumption" => "W",
+        _ => "state"
+    };
+
+    private static string HealthClass(int score) => score switch
+    {
+        >= 80 => "health-good",
+        >= 40 => "health-warn",
+        _ => "health-critical"
+    };
+
+    private async Task AggregateAsync()
+    {
+        if (!double.TryParse(aggMagA, out var a) || !double.TryParse(aggMagB, out var b))
+        {
+            statusMessage = "Enter numeric loads for both devices.";
+            return;
+        }
+        aggregateResult = await Api.AggregateReadingsAsync(aggDeviceA, a, aggDeviceB, b);
+    }
+
+    private async Task LoadBatchAsync()
+    {
+        if (string.IsNullOrWhiteSpace(batchDeviceId))
+        {
+            batchStatus = "Enter a device id first.";
+            return;
+        }
+
+        var samples = batchSamplesCsv
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(s => double.TryParse(s, out var v) ? v : (double?)null)
+            .Where(v => v.HasValue)
+            .Select(v => v!.Value)
+            .ToArray();
+
+        if (samples.Length == 0)
+        {
+            batchStatus = "Enter at least one numeric sample.";
+            return;
+        }
+
+        var result = await Api.LoadBatchAsync(batchDeviceId, samples);
+        batchStatus = result is null
+            ? "Batch load failed."
+            : $"Loaded {samples.Length} samples for {result.DeviceId}. Archive now holds {result.ArchivedCount} entries for this device.";
+    }
+
+    private async Task ValidateTreeAsync()
+    {
+        deploymentValidation = null;
+        deploymentRawError = null;
+        var (ok, result, rawError) = await Api.ValidateDeploymentTreeAsync(deploymentTreeJson);
+        if (!ok)
+        {
+            deploymentRawError = $"Request failed - check your JSON is well formed. ({rawError})";
+            return;
+        }
+        deploymentValidation = result;
+    }
+
+    public void Dispose() => refreshTimer?.Dispose();
+}
